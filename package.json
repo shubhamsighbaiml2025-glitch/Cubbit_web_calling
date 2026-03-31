@@ -1,0 +1,14 @@
+{
+  "name": "notification-socket-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Socket.IO notification relay server for the Flutter app",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  }
+}
