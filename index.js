@@ -1,6 +1,29 @@
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
+const admin = require("firebase-admin");
+
+// Initialize Firebase Admin (Uses local service-account.json or environment config)
+try {
+  let serviceAccount = null;
+  try {
+    serviceAccount = require("./service-account.json");
+  } catch (e) {
+    // Missing local file
+  }
+
+  if (serviceAccount) {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+    console.log("[Firebase] Admin initialized with local service-account.json");
+  } else {
+    admin.initializeApp();
+    console.log("[Firebase] Admin initialized with Application Default Credentials");
+  }
+} catch (err) {
+  console.log("[Firebase] Admin init error:", err.message);
+}
 
 const PORT = process.env.PORT || 3001;
 const INTERNAL_NOTIFY_TOKEN = (process.env.INTERNAL_NOTIFY_TOKEN || "").trim();
@@ -10,12 +33,14 @@ const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
     origin: "*",
-    methods: ["GET", "POST"]
-  }
+    methods: ["GET", "POST"],
+  },
+  pingTimeout: 60000,
+  pingInterval: 25000,
 });
 
-const socketsByUid = new Map(); // uid -> Set<socketId>
-const callRoomPrefix = "call:";
+// uid -> Set<socketId>
+const socketsByUid = new Map();
 
 function registerSocketUid(socket, uidRaw) {
   const uid = (uidRaw || "").toString().trim();
@@ -51,10 +76,17 @@ function emitToUid(uidRaw, event, payload) {
   return count;
 }
 
+// ─── HTTP endpoints ────────────────────────────────────────────────────────────
+
 app.get("/", (_req, res) => {
-  res.json({ ok: true, service: "notification-socket" });
+  res.json({ ok: true, service: "cubbit-notification-socket", version: "2.0.0" });
 });
 
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, connections: socketsByUid.size });
+});
+
+/** Push a notification event to a connected user by uid. */
 app.post("/notify-user", (req, res) => {
   if (INTERNAL_NOTIFY_TOKEN) {
     const auth = (req.headers.authorization || "").toString();
@@ -76,24 +108,87 @@ app.post("/notify-user", (req, res) => {
   return res.json({ ok: true, delivered });
 });
 
+// ─── FCM Push Notification relay (App → NodeJS → Google FCM) ────────────────
+app.post("/api/notify", async (req, res) => {
+  const { tokens, data, notificationTitle, notificationBody, highPriority } = req.body || {};
+
+  if (!tokens || !Array.isArray(tokens) || tokens.length === 0) {
+    return res.status(400).json({ ok: false, error: "tokens required" });
+  }
+
+  // Determine if Firebase Admin is fully initialized before attempting to send.
+  if (admin.apps.length === 0) {
+    console.error("[FCM] Admin SDK not initialized; missing service-account.json?");
+    return res.status(500).json({ ok: false, error: "Server missing Firebase configuration." });
+  }
+
+  const message = {
+    tokens: tokens,
+    data: data || {},
+    android: {
+      priority: highPriority ? "high" : "normal",
+      notification: {
+        channelId: "high_importance_channel",
+        sound: "default",
+        defaultSound: true,
+        defaultVibrateTimings: true,
+      },
+      ttl: highPriority ? 30000 : 3600000,
+    },
+    apns: {
+      headers: {
+        "apns-priority": highPriority ? "10" : "5",
+        "apns-expiration": highPriority ? "30" : "3600",
+      },
+      payload: {
+        aps: {
+          "content-available": 1,
+          sound: "default",
+        },
+      },
+    }
+  };
+
+  if (notificationTitle) {
+    message.notification = {
+      title: notificationTitle,
+      body: notificationBody || "",
+    };
+  }
+
+  try {
+    const response = await admin.messaging().sendEachForMulticast(message);
+    console.log(`[FCM] Sent message successfully: ${response.successCount} sent, ${response.failureCount} failed.`);
+    return res.json({ ok: true, successCount: response.successCount, failureCount: response.failureCount });
+  } catch (error) {
+    console.error("[FCM] Error sending message:", error);
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+// ─── Socket events ─────────────────────────────────────────────────────────────
+
 io.on("connection", (socket) => {
   console.log("[socket] connected", { socketId: socket.id });
 
+  // Register the authenticated user uid with this socket.
   socket.on("register", ({ uid }) => {
     console.log("[notify] register", { socketId: socket.id, uid: uid || "" });
     registerSocketUid(socket, uid);
   });
 
+  // Generic notification relay: { uid, event, payload }
   socket.on("notify_user", ({ uid, event, payload }) => {
     console.log("[notify] notify_user", {
       socketId: socket.id,
       uid: uid || "",
       event: event || "notification",
-      payloadType: typeof payload,
     });
     emitToUid(uid, event || "notification", payload || {});
   });
 
+  // Call invite relay — sender pushes invite to callee instantly (socket path).
+  // Firebase Cloud Functions handle the FCM path for killed/background apps.
   socket.on("call_invite_user", ({ uid, callId, callerUid, callerName, isVideo }) => {
     console.log("[notify] call_invite_user", {
       socketId: socket.id,
@@ -113,71 +208,6 @@ io.on("connection", (socket) => {
     });
   });
 
-  socket.on("join", ({ callId, uid }) => {
-    const cleanCallId = (callId || "").toString().trim();
-    const cleanUid = (uid || "").toString().trim();
-    if (!cleanCallId || !cleanUid) return;
-    const room = `${callRoomPrefix}${cleanCallId}`;
-    socket.join(room);
-    socket.data.callId = cleanCallId;
-    socket.data.uid = cleanUid;
-    registerSocketUid(socket, cleanUid);
-    console.log("[webrtc] join", { socketId: socket.id, callId: cleanCallId, uid: cleanUid });
-  });
-
-  socket.on("offer", ({ callId, from, to, sdp }) => {
-    const cleanCallId = (callId || "").toString().trim();
-    if (!cleanCallId) return;
-    const payload = {
-      callId: cleanCallId,
-      from: (from || "").toString().trim(),
-      to: (to || "").toString().trim(),
-      sdp: sdp || {},
-    };
-    const room = `${callRoomPrefix}${cleanCallId}`;
-    socket.to(room).emit("offer", payload);
-    console.log("[webrtc] offer", { socketId: socket.id, callId: cleanCallId, from: payload.from, to: payload.to });
-  });
-
-  socket.on("answer", ({ callId, from, to, sdp }) => {
-    const cleanCallId = (callId || "").toString().trim();
-    if (!cleanCallId) return;
-    const payload = {
-      callId: cleanCallId,
-      from: (from || "").toString().trim(),
-      to: (to || "").toString().trim(),
-      sdp: sdp || {},
-    };
-    const room = `${callRoomPrefix}${cleanCallId}`;
-    socket.to(room).emit("answer", payload);
-    console.log("[webrtc] answer", { socketId: socket.id, callId: cleanCallId, from: payload.from, to: payload.to });
-  });
-
-  socket.on("candidate", ({ callId, from, to, candidate }) => {
-    const cleanCallId = (callId || "").toString().trim();
-    if (!cleanCallId) return;
-    const payload = {
-      callId: cleanCallId,
-      from: (from || "").toString().trim(),
-      to: (to || "").toString().trim(),
-      candidate: candidate || {},
-    };
-    const room = `${callRoomPrefix}${cleanCallId}`;
-    socket.to(room).emit("candidate", payload);
-  });
-
-  socket.on("end", ({ callId, from }) => {
-    const cleanCallId = (callId || "").toString().trim();
-    if (!cleanCallId) return;
-    const payload = {
-      callId: cleanCallId,
-      from: (from || "").toString().trim(),
-    };
-    const room = `${callRoomPrefix}${cleanCallId}`;
-    socket.to(room).emit("end", payload);
-    console.log("[webrtc] end", { socketId: socket.id, callId: cleanCallId, from: payload.from });
-  });
-
   socket.on("disconnect", () => {
     console.log("[socket] disconnected", {
       socketId: socket.id,
@@ -187,6 +217,8 @@ io.on("connection", (socket) => {
   });
 });
 
+// ─── Start server ──────────────────────────────────────────────────────────────
+
 server.listen(PORT, () => {
-  console.log(`Signaling server listening on ${PORT}`);
+  console.log(`Cubbit notification server listening on port ${PORT}`);
 });
