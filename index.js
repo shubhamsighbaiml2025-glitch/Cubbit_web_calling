@@ -3,23 +3,106 @@ const http = require("http");
 const { Server } = require("socket.io");
 const admin = require("firebase-admin");
 
-// Initialize Firebase Admin (Uses local service-account.json or environment config)
+function _normalizePrivateKey(value) {
+  if (typeof value !== "string") return "";
+  let key = value.trim();
+  if (
+    (key.startsWith('"') && key.endsWith('"')) ||
+    (key.startsWith("'") && key.endsWith("'"))
+  ) {
+    key = key.slice(1, -1);
+  }
+  return key.replace(/\\n/g, "\n");
+}
+
+function _isPlaceholder(value) {
+  return !value || value === "REPLACE_ME";
+}
+
+function _isValidServiceAccount(serviceAccount) {
+  if (!serviceAccount || typeof serviceAccount !== "object") return false;
+  const projectId = (serviceAccount.project_id || "").toString().trim();
+  const clientEmail = (serviceAccount.client_email || "").toString().trim();
+  const privateKey = (serviceAccount.private_key || "").toString().trim();
+  if (
+    _isPlaceholder(projectId) ||
+    _isPlaceholder(clientEmail) ||
+    _isPlaceholder(privateKey)
+  ) {
+    return false;
+  }
+  return (
+    privateKey.includes("BEGIN PRIVATE KEY") &&
+    privateKey.includes("END PRIVATE KEY")
+  );
+}
+
+function _serviceAccountFromEnv() {
+  const projectId = (
+    process.env.FIREBASE_PROJECT_ID ||
+    process.env.GOOGLE_CLOUD_PROJECT ||
+    process.env.GCLOUD_PROJECT ||
+    ""
+  )
+    .toString()
+    .trim();
+  const clientEmail = (
+    process.env.FIREBASE_CLIENT_EMAIL ||
+    process.env.GOOGLE_CLIENT_EMAIL ||
+    ""
+  )
+    .toString()
+    .trim();
+  const privateKey = _normalizePrivateKey(
+    process.env.FIREBASE_PRIVATE_KEY || process.env.GOOGLE_PRIVATE_KEY || ""
+  );
+  const privateKeyId = (
+    process.env.FIREBASE_PRIVATE_KEY_ID ||
+    process.env.GOOGLE_PRIVATE_KEY_ID ||
+    ""
+  )
+    .toString()
+    .trim();
+
+  const candidate = {
+    project_id: projectId,
+    client_email: clientEmail,
+    private_key: privateKey,
+  };
+  if (privateKeyId) {
+    candidate.private_key_id = privateKeyId;
+  }
+  return candidate;
+}
+
+// Initialize Firebase Admin (prefers env vars; falls back to local file)
 try {
-  let serviceAccount = null;
+  let localServiceAccount = null;
   try {
-    serviceAccount = require("./service-account.json");
+    localServiceAccount = require("./service-account.json");
   } catch (e) {
     // Missing local file
   }
 
-  if (serviceAccount) {
+  const envServiceAccount = _serviceAccountFromEnv();
+  const hasValidEnvServiceAccount = _isValidServiceAccount(envServiceAccount);
+  const hasValidLocalServiceAccount = _isValidServiceAccount(localServiceAccount);
+
+  if (hasValidEnvServiceAccount) {
     admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
+      credential: admin.credential.cert(envServiceAccount),
+    });
+    console.log("[Firebase] Admin initialized with Render environment variables");
+  } else if (hasValidLocalServiceAccount) {
+    admin.initializeApp({
+      credential: admin.credential.cert(localServiceAccount),
     });
     console.log("[Firebase] Admin initialized with local service-account.json");
   } else {
     admin.initializeApp();
-    console.log("[Firebase] Admin initialized with Application Default Credentials");
+    console.log(
+      "[Firebase] Admin initialized with Application Default Credentials (no explicit service account)"
+    );
   }
 } catch (err) {
   console.log("[Firebase] Admin init error:", err.message);
