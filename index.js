@@ -2,6 +2,7 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const admin = require("firebase-admin");
+const nodemailer = require("nodemailer");
 
 function _normalizePrivateKey(value) {
   if (typeof value !== "string") return "";
@@ -122,6 +123,17 @@ const io = new Server(server, {
   pingInterval: 25000,
 });
 
+// ─── Email Configuration (Brevo) ─────────────────────────────────────────────
+const transporter = nodemailer.createTransport({
+  host: "smtp-relay.brevo.com",
+  port: 587,
+  secure: false,
+  auth: {
+    user: "a70ba5001@smtp-brevo.com",
+    pass: "xsmtpsib-06225f5c0c942b47f078f17e53580edab67ad5f9aa7149771f6fe33830022d2f-PPZK2Q95h8w9vdTA"
+  }
+});
+
 // uid -> Set<socketId>
 const socketsByUid = new Map();
 
@@ -167,6 +179,28 @@ app.get("/", (_req, res) => {
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, connections: socketsByUid.size });
+});
+
+/** Welcome Email Endpoint (Free replacement for Firebase Functions) */
+app.post("/api/welcome-email", async (req, res) => {
+  const { email, name } = req.body || {};
+  if (!email) return res.status(400).json({ ok: false, error: "email required" });
+
+  const mailOptions = {
+    from: "Cubbit Support <a70ba5001@smtp-brevo.com>",
+    to: email,
+    subject: "Welcome to Cubbit 🎉",
+    text: `Hi ${name || 'there'},\n\nThank you for downloading Cubbit!\n\nJoin Cubbit Community:\nOpen Cubbit App → Search → "Cubbit Community"\n\nNeed help?\nSinghshubham29392@gmail.com\nanibeshsingh2@gmail.com\n\nDownload latest version:\nhttps://cubbit-web.onrender.com/`
+  };
+
+  try {
+    await transporter.sendMail(mailOptions);
+    console.log(`[Email] Welcome email sent to ${email}`);
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error("[Email] Error sending welcome email:", error);
+    return res.status(500).json({ ok: false, error: error.message });
+  }
 });
 
 /** Push a notification event to a connected user by uid. */
